@@ -1,4 +1,4 @@
-# Q1-style 3-stage legal dialogue research pipeline (standalone)
+#style 3-stage legal dialogue research pipeline (standalone)
 
 This folder contains **only** the 3-stage pipeline we discussed:
 
