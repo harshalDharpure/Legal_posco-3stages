@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 import yaml
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer, TrainerCallback, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback, TrainingArguments
 
 _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
@@ -36,6 +36,14 @@ from q1_3stage_pipeline.utils import load_jsonl, set_global_seed
 def load_yaml(p: str) -> dict:
     with open(p, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+def _save_run_config(dst_dir: str, cfg_path: str, extra: dict) -> None:
+    os.makedirs(dst_dir, exist_ok=True)
+    with open(os.path.join(dst_dir, "config_used.yaml"), "w", encoding="utf-8") as f:
+        with open(cfg_path, encoding="utf-8") as src:
+            f.write(src.read())
+    with open(os.path.join(dst_dir, "run_args.json"), "w", encoding="utf-8") as f:
+        json.dump(extra, f, indent=2, ensure_ascii=False)
 
 
 class JsonlLossLogger(TrainerCallback):
@@ -63,6 +71,16 @@ def main() -> None:
     ap.add_argument("--val-jsonl", default="")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument(
+        "--full-finetune",
+        action="store_true",
+        help="If set, fully fine-tune ALL parameters (no LoRA, no quantization). This is the strict default for Q1.",
+    )
+    ap.add_argument(
+        "--use-lora",
+        action="store_true",
+        help="Enable LoRA (memory fallback). Only use if you cannot full-finetune.",
+    )
+    ap.add_argument(
         "--metrics-dir",
         default="",
         help="Separate folder to store loss/metrics logs (jsonl + summary). If empty, uses <logs_root>/stage1_metrics/<run_name>.",
@@ -82,20 +100,35 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(base, quantization_config=bnb, device_map="auto")
-    lora = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
-    model = get_peft_model(model, lora)
+    # STRICT Stage 1 requirement: fully fine-tune all parameters, no freezing.
+    # LoRA is allowed only as a memory fallback.
+    if args.use_lora and args.full_finetune:
+        raise SystemExit("Choose only one of --full-finetune or --use-lora.")
+    if (not args.use_lora) and (not args.full_finetune):
+        # Make strict behavior the default.
+        args.full_finetune = True
+
+    if args.full_finetune:
+        model = AutoModelForCausalLM.from_pretrained(
+            base,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+    else:
+        # Memory fallback: LoRA fine-tuning in fp16 (no 4-bit by default; keep behavior explicit).
+        model = AutoModelForCausalLM.from_pretrained(
+            base,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else None,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+        lora = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        )
+        model = get_peft_model(model, lora)
 
     train_path = args.train_jsonl if os.path.isabs(args.train_jsonl) else str(_REPO / args.train_jsonl)
     val_path = (
@@ -122,6 +155,20 @@ def main() -> None:
     metrics_dir = metrics_dir if os.path.isabs(metrics_dir) else str(_REPO / metrics_dir)
     os.makedirs(metrics_dir, exist_ok=True)
     loss_jsonl = os.path.join(metrics_dir, "loss_log.jsonl")
+    _save_run_config(
+        metrics_dir,
+        cfg_path,
+        {
+            "stage": "stage1_sft",
+            "train_jsonl": train_path,
+            "val_jsonl": val_path if val_path else "",
+            "output_dir": out_dir,
+            "metrics_dir": metrics_dir,
+            "seed": args.seed,
+            "full_finetune": bool(args.full_finetune),
+            "use_lora": bool(args.use_lora),
+        },
+    )
 
     ta_kwargs = dict(
         output_dir=out_dir,
@@ -156,6 +203,16 @@ def main() -> None:
     )
     train_out = trainer.train()
 
+    # Perplexity (from final eval loss if available).
+    ppl = None
+    try:
+        if val_ds:
+            eval_metrics = trainer.evaluate()
+            if "eval_loss" in eval_metrics and eval_metrics["eval_loss"] is not None:
+                ppl = float(torch.exp(torch.tensor(eval_metrics["eval_loss"])).item())
+    except Exception:
+        ppl = None
+
     # Save a compact summary (separate from checkpoints).
     summary = {
         "base_model": base,
@@ -165,10 +222,13 @@ def main() -> None:
         "val_jsonl": val_path if val_path else "",
         "output_dir": out_dir,
         "metrics_dir": metrics_dir,
+        "full_finetune": bool(args.full_finetune),
+        "use_lora": bool(args.use_lora),
         "train_runtime": float(getattr(train_out, "metrics", {}).get("train_runtime", 0.0)) if train_out else 0.0,
         "train_samples": len(train_rows),
         "val_samples": len(val_rows) if val_rows else 0,
         "final_metrics": getattr(train_out, "metrics", {}) if train_out else {},
+        "val_perplexity": ppl,
     }
     with open(os.path.join(metrics_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)

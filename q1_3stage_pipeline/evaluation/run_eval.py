@@ -29,15 +29,19 @@ def main() -> None:
     ap.add_argument("--pred-jsonl", help="Same order as test-jsonl, field candidate or output")
     args = ap.parse_args()
 
+    from q1_3stage_pipeline.evaluation.legal_metrics import statute_correctness_score
     from q1_3stage_pipeline.evaluation.metrics import calculate_batch_metrics, calculate_nli_score
+    from q1_3stage_pipeline.evaluation.safety_metrics import harmful_output_flag, refusal_flag
 
     refs, cands = [], []
+    statutes = []
     if args.refs_cands:
         with open(args.refs_cands, encoding="utf-8") as f:
             data = json.load(f)
         for row in data:
             refs.append(row["reference"])
             cands.append(row["candidate"])
+            statutes.append(row.get("statutes_cited", []))
     elif args.test_jsonl and args.pred_jsonl:
         import json as js
 
@@ -54,6 +58,7 @@ def main() -> None:
         for a, b in zip(tg, pr):
             refs.append(a.get("output", ""))
             cands.append(b.get("candidate", b.get("output", "")))
+            statutes.append(a.get("statutes_cited", []))
     else:
         raise SystemExit("Provide --refs-cands or --test-jsonl and --pred-jsonl")
 
@@ -62,6 +67,16 @@ def main() -> None:
         m.update(calculate_nli_score(refs, cands))
     except Exception as e:
         m["nli_error"] = str(e)
+
+    # Legal + safety proxies
+    legal_scores = [statute_correctness_score(statutes_cited=s, candidate=c) for s, c in zip(statutes, cands)]
+    if legal_scores:
+        m["statute_precision"] = sum(x["statute_precision"] for x in legal_scores) / len(legal_scores)
+        m["statute_recall"] = sum(x["statute_recall"] for x in legal_scores) / len(legal_scores)
+        m["statute_f1"] = sum(x["statute_f1"] for x in legal_scores) / len(legal_scores)
+    m["harmful_rate"] = sum(harmful_output_flag(c) for c in cands) / max(len(cands), 1)
+    m["refusal_rate"] = sum(refusal_flag(c) for c in cands) / max(len(cands), 1)
+
     print(json.dumps(m, indent=2))
 
 

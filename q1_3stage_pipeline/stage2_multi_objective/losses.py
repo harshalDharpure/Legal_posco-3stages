@@ -7,9 +7,9 @@ L_entail (default, differentiable): frozen sentence encoder; maximize similarity
 reference answer y+ and pooled hidden states of the assistant span (semantic alignment).
 This avoids non-differentiable argmax→DeBERTa while staying faithful to "entailment-style" supervision.
 
-Optional L_entail_deberta: KL to one-hot ENTAILMENT for (premise=y_ref, hypothesis=greedy decode).
-Computed with torch.no_grad on NLI weights; greedy decode breaks LM gradients — use only for
-logging / auxiliary distillation hooks, not added to backward unless you add a STE/REINFORCE path.
+L_entail (spec-faithful, trainable): frozen DeBERTa-large MNLI provides a teacher distribution
+over NLI labels for (premise=y_ref, hypothesis=y_hat). A small student head predicts the same
+distribution from LM pooled hidden states; the loss is KL(teacher || student).
 """
 
 from __future__ import annotations
@@ -57,6 +57,54 @@ class FrozenSentenceEncoder:
             device=str(device),
         )
         return emb.float()
+
+
+class FrozenNLITeacher:
+    """Frozen DeBERTa MNLI teacher producing probabilities over 3 labels."""
+
+    def __init__(self, model_name: str = "microsoft/deberta-large-mnli"):
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    @torch.no_grad()
+    def probs(self, premises: list[str], hypotheses: list[str], device: torch.device) -> torch.Tensor:
+        enc = self.tokenizer(
+            premises,
+            hypotheses,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        out = self.model(**enc)
+        return F.softmax(out.logits.float(), dim=-1)
+
+
+class EntailmentStudentHead(torch.nn.Module):
+    """Student NLI head predicting 3-way MNLI distribution from pooled LM hidden."""
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.proj = torch.nn.Linear(hidden_size, 3)
+
+    def forward(self, pooled_hidden: torch.Tensor) -> torch.Tensor:
+        return self.proj(pooled_hidden.float())
+
+
+def kl_teacher_student(teacher_probs: torch.Tensor, student_logits: torch.Tensor) -> torch.Tensor:
+    """
+    KL(teacher || student) averaged over batch.
+    teacher_probs: (B, 3) simplex
+    student_logits: (B, 3)
+    """
+    log_q = F.log_softmax(student_logits, dim=-1)
+    return F.kl_div(log_q, teacher_probs, reduction="batchmean")
 
 
 def entailment_cosine_loss(

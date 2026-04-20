@@ -16,6 +16,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="q1_3stage_pipeline/configs/pipeline_default.yaml")
     ap.add_argument("--train-jsonl", default="q1_3stage_pipeline/data/splits/train.jsonl")
+    ap.add_argument("--val-jsonl", default="q1_3stage_pipeline/data/splits/val.jsonl")
+    ap.add_argument("--m1-path", required=True, help="Stage1 final checkpoint to initialize Stage2 (strict).")
     ap.add_argument("--init-from", choices=["base", "exp3"], default="base")
     ap.add_argument("--out-root", default="q1_3stage_pipeline/logs/checkpoints/stage2_ablations")
     args = ap.parse_args()
@@ -30,11 +32,15 @@ def main() -> None:
             "--config",
             str(_REPO / args.config),
             "--init-from",
-            args.init_from,
+            "m1",
+            "--m1-path",
+            str(_REPO / args.m1_path) if not os.path.isabs(args.m1_path) else args.m1_path,
             "--ablation",
             m,
             "--train-jsonl",
             str(_REPO / args.train_jsonl),
+            "--val-jsonl",
+            str(_REPO / args.val_jsonl),
             "--output-dir",
             str(out),
         ]

@@ -2,8 +2,11 @@
 """
 Stage 3: DPO alignment (TRL) on top of M2.
 
-Preferences JSONL lines:
-  {"prompt": "User: ...\\nAssistant:", "chosen": " ...", "rejected": " ..."}
+STRICT:
+- Dataset derives from master dialogue JSONL (split) only.
+- Chosen = ground truth.
+- Rejected = dynamic hard negatives (NOT stored in dataset).
+- Reference model = M2 (frozen).
 """
 
 from __future__ import annotations
@@ -12,12 +15,20 @@ import argparse
 import json
 import os
 import sys
+import random
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+from q1_3stage_pipeline.stage2_multi_objective.hard_negatives import (
+    corrupt_legal_text,
+    cross_sample_negative,
+    model_negative_generate,
+    select_hard_negative,
+)
+from q1_3stage_pipeline.utils import DatasetBuilder, load_jsonl, set_global_seed
 
 def load_prefs(path: str) -> dict:
     prompts, chosen, rejected = [], [], []
@@ -37,20 +48,16 @@ def main() -> None:
     try:
         import torch
         from datasets import Dataset
-        from peft import LoraConfig, TaskType, get_peft_model
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         from trl import DPOConfig, DPOTrainer
+        from sentence_transformers import SentenceTransformer
     except ImportError as e:
         raise SystemExit(f"Install trl peft datasets: {e}") from e
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-model", default="meta-llama/Meta-Llama-3.1-8B-Instruct")
-    ap.add_argument(
-        "--model-path",
-        required=True,
-        help="Merged HF checkpoint dir, or PEFT adapter folder (with base loaded from base-model)",
-    )
-    ap.add_argument("--preferences", required=True, help="JSONL prompt, chosen, rejected")
+    ap.add_argument("--m2-path", required=True, help="Stage2 final checkpoint folder (HF) for policy init + reference.")
+    ap.add_argument("--train-jsonl", default="", help="Dialogue-level split JSONL (strict). If set, preferences are generated dynamically.")
+    ap.add_argument("--preferences", default="", help="Optional: prebuilt preferences JSONL (not recommended for strict mode).")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--beta", type=float, default=0.1)
     ap.add_argument("--lr", type=float, default=5e-6)
@@ -62,45 +69,70 @@ def main() -> None:
     ap.add_argument("--max-prompt-length", type=int, default=1536)
     args = ap.parse_args()
 
-    raw = load_prefs(args.preferences if os.path.isabs(args.preferences) else str(_REPO / args.preferences))
-    dataset = Dataset.from_dict(raw)
+    set_global_seed(args.seed)
 
-    tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=False)
+    m2_path = args.m2_path if os.path.isabs(args.m2_path) else str(_REPO / args.m2_path)
+
+    if args.preferences and args.train_jsonl:
+        raise SystemExit("Provide only one of --train-jsonl (strict dynamic) or --preferences.")
+    if not args.preferences and not args.train_jsonl:
+        raise SystemExit("Provide --train-jsonl (recommended) or --preferences.")
+
+    if args.preferences:
+        raw = load_prefs(args.preferences if os.path.isabs(args.preferences) else str(_REPO / args.preferences))
+        dataset = Dataset.from_dict(raw)
+    else:
+        split_path = args.train_jsonl if os.path.isabs(args.train_jsonl) else str(_REPO / args.train_jsonl)
+        rows = load_jsonl(split_path)
+        builder = DatasetBuilder(rows)
+        sft = builder.build_sft()
+
+        # Frozen SBERT for filtering/hard mining.
+        sbert = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+        for p in sbert.parameters():
+            p.requires_grad = False
+
+        # We'll load policy model first (used for generation of model negative).
+        tok = AutoTokenizer.from_pretrained(m2_path, use_fast=False)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        policy_for_gen = AutoModelForCausalLM.from_pretrained(m2_path, torch_dtype=torch.float16, device_map="auto")
+        gen_device = next(policy_for_gen.parameters()).device
+
+        rng = random.Random(args.seed)
+        prompts, chosen, rejected = [], [], []
+        for ex in sft:
+            x = ex["prompt"]
+            y_pos = ex["output"]
+            # Dynamic rejected from 3 candidate sources.
+            cand1 = model_negative_generate(policy_for_gen, tok, x, gen_device, rng)
+            cand2 = corrupt_legal_text(y_pos)
+            cand3 = cross_sample_negative(sft, rng, avoid_dialogue_id=str(ex.get("dialogue_id", "")))
+            y_neg = select_hard_negative(
+                x=x,
+                y_pos=y_pos,
+                candidates=[cand1, cand2, cand3],
+                sentence_encoder=sbert,
+                sim_high_threshold=0.2,
+            )
+            prompts.append(x)
+            chosen.append(y_pos)
+            rejected.append(y_neg)
+
+        del policy_for_gen
+        torch.cuda.empty_cache()
+        dataset = Dataset.from_dict({"prompt": prompts, "chosen": chosen, "rejected": rejected})
+
+    tok = AutoTokenizer.from_pretrained(m2_path, use_fast=False)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        quantization_config=bnb,
-        device_map="auto",
-    )
-
-    from peft import PeftModel
-
-    if os.path.isfile(os.path.join(args.model_path, "adapter_config.json")):
-        model = PeftModel.from_pretrained(model, args.model_path)
-    else:
-        del model
-        torch.cuda.empty_cache()
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            quantization_config=bnb,
-            device_map="auto",
-        )
-
-    lora = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=32,
-        lora_alpha=64,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
-    model = get_peft_model(model, lora)
+    # Policy init = M2; Reference = M2 frozen (strict spec).
+    model = AutoModelForCausalLM.from_pretrained(m2_path, torch_dtype=torch.float16, device_map="auto")
+    ref_model = AutoModelForCausalLM.from_pretrained(m2_path, torch_dtype=torch.float16, device_map="auto")
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
 
     dpo_args = DPOConfig(
         output_dir=args.output_dir,
@@ -120,7 +152,7 @@ def main() -> None:
     try:
         trainer = DPOTrainer(
             model=model,
-            ref_model=None,
+            ref_model=ref_model,
             args=dpo_args,
             train_dataset=dataset,
             processing_class=tok,
@@ -128,7 +160,7 @@ def main() -> None:
     except TypeError:
         trainer = DPOTrainer(
             model=model,
-            ref_model=None,
+            ref_model=ref_model,
             args=dpo_args,
             train_dataset=dataset,
             tokenizer=tok,

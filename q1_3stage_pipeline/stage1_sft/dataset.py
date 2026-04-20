@@ -16,30 +16,43 @@ def _dialogue_to_examples(dialogue_row: dict[str, Any]) -> list[dict[str, Any]]:
     This does NOT write any new files; it is only used at training time.
     """
     turns = dialogue_row.get("turns", [])
-    user_queries = [t.get("text", "") for t in turns if t.get("role") == "user"]
-    assistant_responses = [t.get("text", "") for t in turns if t.get("role") == "assistant"]
-    n = min(len(user_queries), len(assistant_responses))
     out: list[dict[str, Any]] = []
-    for i in range(n):
-        ex = {
-            # Keep original metadata if present
-            "dialogue_id": dialogue_row.get("dialogue_id", ""),
-            "language": dialogue_row.get("language", ""),
-            "complexity": dialogue_row.get("complexity", ""),
-            "bucket": dialogue_row.get("bucket", ""),
-            "case_id": dialogue_row.get("case_id", 0),
-            "statutes_cited": dialogue_row.get("statutes_cited", []),
-            # Training pair
-            "input": str(user_queries[i]).strip(),
-            "output": str(assistant_responses[i]).strip(),
-            "turn_index": i + 1,
-        }
-        # Carry negatives if someone pre-attached them at dialogue level (optional).
-        if "negative_output" in dialogue_row:
-            ex["negative_output"] = dialogue_row.get("negative_output")
-        if "hard_negative" in dialogue_row:
-            ex["hard_negative"] = dialogue_row.get("hard_negative")
-        out.append(ex)
+
+    # Rolling-window context:
+    # Turn1 -> Turn2
+    # Turn1+2 -> Turn3
+    # ... where "input" is the concatenated dialogue history up to the user turn
+    # preceding the target assistant response.
+    history: list[str] = []
+    turn_i = 0
+    for t in turns:
+        role = str(t.get("role", "")).strip().lower()
+        text = str(t.get("text", "")).strip()
+        if not role or not text:
+            continue
+
+        if role == "user":
+            history.append(f"[USER]: {text}")
+        elif role == "assistant":
+            # Only create an example if there is some preceding user context.
+            if history:
+                inp = "\n".join(history) + "\n[ASSISTANT]:"
+                ex = {
+                    # Keep original metadata if present
+                    "dialogue_id": dialogue_row.get("dialogue_id", ""),
+                    "language": dialogue_row.get("language", ""),
+                    "statutes_cited": dialogue_row.get("statutes_cited", []),
+                    "metadata": dialogue_row.get("metadata", {}),
+                    # Training pair
+                    "input": inp,
+                    "output": text,
+                    "turn_index": turn_i,
+                }
+                out.append(ex)
+            history.append(f"[ASSISTANT]: {text}")
+        else:
+            continue
+        turn_i += 1
     return out
 
 
@@ -78,9 +91,20 @@ class LegalSFTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.examples[idx]
-        user = row.get("input", "").strip()
-        assistant = row.get("output", "").strip()
-        text = format_dialogue_prompt(user, assistant)
+        # `input` is already a fully formatted prompt ending with "[ASSISTANT]:"
+        # OR a raw user string (pair-level legacy); we normalize to the strict template.
+        inp = str(row.get("input", "")).strip()
+        assistant = str(row.get("output", "")).strip()
+        if "[ASSISTANT]:" in inp and inp.startswith("[USER]:"):
+            text = inp + f" {assistant}"
+            # For masking, we want labels to start right after the final "[ASSISTANT]: "
+            # in this prompt.
+            prefix = inp + " "
+            plen = len(self.tokenizer(prefix, add_special_tokens=False)["input_ids"])
+        else:
+            # Legacy pair-level support: treat `input` as user-only.
+            text = format_dialogue_prompt(inp, assistant)
+            plen = prompt_prefix_tokens_len(self.tokenizer, inp)
         enc = self.tokenizer(
             text,
             max_length=self.max_length,
@@ -90,7 +114,7 @@ class LegalSFTDataset(Dataset):
         )
         input_ids = enc["input_ids"]
         attn = enc["attention_mask"]
-        plen = min(prompt_prefix_tokens_len(self.tokenizer, user), len(input_ids))
+        plen = min(int(plen), len(input_ids))
         labels = input_ids.copy()
         for i in range(plen):
             labels[i] = -100

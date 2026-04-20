@@ -21,6 +21,22 @@ def paired_t_statistic(before: list[float], after: list[float]) -> tuple[float, 
     return float(t), n - 1
 
 
+def paired_t_test(before: list[float], after: list[float]) -> dict[str, float]:
+    """
+    Paired t-test with p-value (scipy if available). Returns t, df, p_value.
+    """
+    t, df = paired_t_statistic(before, after)
+    out = {"t": float(t), "df": float(df), "p_value": 1.0}
+    try:
+        from scipy import stats  # type: ignore
+
+        if df > 0:
+            out["p_value"] = float(2.0 * stats.t.sf(abs(t), df))
+    except Exception:
+        out["p_value"] = 1.0
+    return out
+
+
 def bootstrap_mean_ci(values: list[float], n_boot: int = 1000, seed: int = 42, alpha: float = 0.05) -> tuple[float, float, float]:
     rng = np.random.RandomState(seed)
     arr = np.asarray(values, dtype=np.float64)
