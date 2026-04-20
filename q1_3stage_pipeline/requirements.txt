@@ -1,0 +1,12 @@
+# Minimal dependencies for q1_3stage_pipeline/
+# Install on top of your base environment that already has torch + transformers.
+sentence-transformers>=2.2.0
+trl>=0.7.0
+peft>=0.10.0
+accelerate>=0.25.0
+datasets>=2.14.0
+scipy>=1.11.0
+nltk
+rouge-score
+bert-score
+

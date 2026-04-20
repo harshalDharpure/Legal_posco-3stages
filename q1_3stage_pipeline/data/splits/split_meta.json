@@ -1,0 +1,15 @@
+{
+  "source": "q1_3stage_pipeline/data/raw/train.jsonl",
+  "seed": 42,
+  "ratios": [
+    0.8,
+    0.1,
+    0.1
+  ],
+  "counts": {
+    "train": 2604,
+    "val": 325,
+    "test": 326,
+    "total": 3255
+  }
+}
