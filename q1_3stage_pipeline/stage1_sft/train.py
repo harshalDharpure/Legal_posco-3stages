@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 import yaml
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer, TrainerCallback, TrainingArguments
 
 _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
@@ -81,12 +81,22 @@ def main() -> None:
         help="Enable LoRA (memory fallback). Only use if you cannot full-finetune.",
     )
     ap.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="If set, load the base model in 4-bit (QLoRA-style). Recommended with --use-lora to avoid OOM.",
+    )
+    ap.add_argument(
         "--metrics-dir",
         default="",
         help="Separate folder to store loss/metrics logs (jsonl + summary). If empty, uses <logs_root>/stage1_metrics/<run_name>.",
     )
     ap.add_argument("--run-name", default="", help="Optional run name for metrics folder naming.")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="Enable FSDP (multi-GPU full fine-tuning). Run via `accelerate launch --num_processes <N> ...`.",
+    )
     args = ap.parse_args()
 
     set_global_seed(args.seed)
@@ -109,17 +119,27 @@ def main() -> None:
         args.full_finetune = True
 
     if args.full_finetune:
+        # For FSDP / distributed training we must NOT use device_map="auto".
+        device_map = None if args.fsdp else ("auto" if torch.cuda.is_available() else None)
         model = AutoModelForCausalLM.from_pretrained(
             base,
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
-            device_map="auto" if torch.cuda.is_available() else None,
+            device_map=device_map,
         )
     else:
-        # Memory fallback: LoRA fine-tuning in fp16 (no 4-bit by default; keep behavior explicit).
+        # Memory fallback: LoRA fine-tuning. Prefer 4-bit base weights when enabled.
+        quant = None
+        if args.load_in_4bit:
+            quant = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
         model = AutoModelForCausalLM.from_pretrained(
             base,
             torch_dtype=torch.float16 if torch.cuda.is_available() else None,
             device_map="auto" if torch.cuda.is_available() else None,
+            quantization_config=quant,
         )
         lora = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -183,6 +203,12 @@ def main() -> None:
         report_to="none",
         seed=args.seed,
     )
+    if args.fsdp:
+        # Minimal FSDP setup for LLaMA-style transformer blocks.
+        # Use accelerate launcher + multiple GPUs.
+        ta_kwargs["fsdp"] = "full_shard auto_wrap"
+        ta_kwargs["fsdp_transformer_layer_cls_to_wrap"] = "LlamaDecoderLayer"
+        ta_kwargs["gradient_checkpointing"] = True
     if val_ds:
         ta_kwargs["eval_strategy"] = "steps"
         ta_kwargs["eval_steps"] = int(tc.get("eval_steps", 500))
@@ -198,7 +224,6 @@ def main() -> None:
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collate_fn,
-        tokenizer=tokenizer,
         callbacks=[JsonlLossLogger(loss_jsonl)],
     )
     train_out = trainer.train()

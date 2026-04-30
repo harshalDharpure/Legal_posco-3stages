@@ -44,7 +44,8 @@ class FrozenSentenceEncoder:
     def __init__(self, model_name: str):
         from sentence_transformers import SentenceTransformer
 
-        self.encoder = SentenceTransformer(model_name)
+        # Keep SBERT on CPU to avoid competing with the policy LM VRAM.
+        self.encoder = SentenceTransformer(model_name, device="cpu")
         for p in self.encoder.parameters():
             p.requires_grad = False
 
@@ -70,6 +71,15 @@ class FrozenNLITeacher:
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False
+        self._device = torch.device("cpu")
+
+    def move_to(self, device: torch.device, *, dtype: torch.dtype | None = None) -> None:
+        self._device = device
+        if dtype is None:
+            self.model.to(device)
+        else:
+            self.model.to(device=device, dtype=dtype)
+        self.model.eval()
 
     @torch.no_grad()
     def probs(self, premises: list[str], hypotheses: list[str], device: torch.device) -> torch.Tensor:

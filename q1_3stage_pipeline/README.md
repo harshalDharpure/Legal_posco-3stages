@@ -70,9 +70,9 @@ If you already created the dialogue-level split (NO pairs) with:
 `data/create_70_10_20_split_dialogue_level.py`,
 then use:
 
-- `q1_3stage_pipeline/data/splits_dialogue_level/train_70_dialogues.jsonl`
-- `q1_3stage_pipeline/data/splits_dialogue_level/val_10_dialogues.jsonl`
-- `q1_3stage_pipeline/data/splits_dialogue_level/test_20_dialogues.jsonl`
+- `q1_3stage_pipeline/data/train_70_dialogues.jsonl`
+- `q1_3stage_pipeline/data/val_10_dialogues.jsonl`
+- `q1_3stage_pipeline/data/test_20_dialogues.jsonl`
 
 The training code will flatten dialogues into (input, output) examples **in-memory**.
 
@@ -101,8 +101,8 @@ All stages use the same strict prompt template:
 ```bash
 python3 q1_3stage_pipeline/stage1_sft/train.py \
   --config q1_3stage_pipeline/configs/pipeline_default.yaml \
-  --train-jsonl q1_3stage_pipeline/data/splits_dialogue_level/train_70_dialogues.jsonl \
-  --val-jsonl q1_3stage_pipeline/data/splits_dialogue_level/val_10_dialogues.jsonl \
+  --train-jsonl q1_3stage_pipeline/data/train_70_dialogues.jsonl \
+  --val-jsonl q1_3stage_pipeline/data/val_10_dialogues.jsonl \
   --output-dir q1_3stage_pipeline/logs/checkpoints/stage1/M1_seed42 \
   --seed 42
 ```
@@ -124,8 +124,8 @@ python3 q1_3stage_pipeline/stage2_multi_objective/train.py \
   --init-from m1 \
   --m1-path q1_3stage_pipeline/logs/checkpoints/stage1/M1_seed42/final \
   --ablation full \
-  --train-jsonl q1_3stage_pipeline/data/splits_dialogue_level/train_70_dialogues.jsonl \
-  --val-jsonl q1_3stage_pipeline/data/splits_dialogue_level/val_10_dialogues.jsonl \
+  --train-jsonl q1_3stage_pipeline/data/train_70_dialogues.jsonl \
+  --val-jsonl q1_3stage_pipeline/data/val_10_dialogues.jsonl \
   --output-dir q1_3stage_pipeline/logs/checkpoints/stage2/M2_fromM1_full_seed42 \
   --eval-every 50 \
   --seed 42
@@ -141,7 +141,7 @@ Stage 3 runs DPO where:
 ```bash
 python3 q1_3stage_pipeline/stage3_dpo/train.py \
   --m2-path q1_3stage_pipeline/logs/checkpoints/stage2/M2_fromM1_full_seed42/final \
-  --train-jsonl q1_3stage_pipeline/data/splits_dialogue_level/train_70_dialogues.jsonl \
+  --train-jsonl q1_3stage_pipeline/data/train_70_dialogues.jsonl \
   --output-dir q1_3stage_pipeline/logs/checkpoints/stage3/M3_beta0.1_seed42 \
   --beta 0.1 \
   --seed 42
@@ -153,7 +153,7 @@ python3 q1_3stage_pipeline/stage3_dpo/train.py \
 for beta in 0.1 0.5 1.0; do
   python3 q1_3stage_pipeline/stage3_dpo/train.py \
     --m2-path q1_3stage_pipeline/logs/checkpoints/stage2/M2_fromM1_full_seed42/final \
-    --train-jsonl q1_3stage_pipeline/data/splits_dialogue_level/train_70_dialogues.jsonl \
+    --train-jsonl q1_3stage_pipeline/data/train_70_dialogues.jsonl \
     --output-dir "q1_3stage_pipeline/logs/checkpoints/stage3/M3_beta${beta}_seed42" \
     --beta "$beta" \
     --seed 42
@@ -165,8 +165,8 @@ done
 ```bash
 python3 q1_3stage_pipeline/ablation/run_stage2_ablations.py \
   --config q1_3stage_pipeline/configs/pipeline_default.yaml \
-  --train-jsonl q1_3stage_pipeline/data/splits_dialogue_level/train_70_dialogues.jsonl \
-  --val-jsonl q1_3stage_pipeline/data/splits_dialogue_level/val_10_dialogues.jsonl \
+  --train-jsonl q1_3stage_pipeline/data/train_70_dialogues.jsonl \
+  --val-jsonl q1_3stage_pipeline/data/val_10_dialogues.jsonl \
   --m1-path q1_3stage_pipeline/logs/checkpoints/stage1/M1_seed42/final \
   --out-root q1_3stage_pipeline/logs/checkpoints/stage2_ablations
 ```
@@ -178,7 +178,7 @@ You must generate model outputs on the **test split** first, then run `run_eval.
 
 ```bash
 python3 q1_3stage_pipeline/evaluation/run_eval.py \
-  --test-jsonl q1_3stage_pipeline/data/splits_dialogue_level/test_20_dialogues.jsonl \
+  --test-jsonl q1_3stage_pipeline/data/test_20_dialogues.jsonl \
   --pred-jsonl q1_3stage_pipeline/logs/preds.jsonl
 ```
 
@@ -196,8 +196,8 @@ Example for Stage 1:
 for seed in 42 43 44; do
   python3 q1_3stage_pipeline/stage1_sft/train.py \
     --config q1_3stage_pipeline/configs/pipeline_default.yaml \
-    --train-jsonl q1_3stage_pipeline/data/splits_dialogue_level/train_70_dialogues.jsonl \
-    --val-jsonl q1_3stage_pipeline/data/splits_dialogue_level/val_10_dialogues.jsonl \
+    --train-jsonl q1_3stage_pipeline/data/train_70_dialogues.jsonl \
+    --val-jsonl q1_3stage_pipeline/data/val_10_dialogues.jsonl \
     --output-dir "q1_3stage_pipeline/logs/checkpoints/stage1/M1_seed${seed}" \
     --seed "$seed"
 done

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.so
+
+# Large local artifacts
+q1_3stage_pipeline/logs/
+q1_3stage_pipeline/data/final_train_dialogues.jsonl
+

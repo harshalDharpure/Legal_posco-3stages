@@ -1,0 +1,271 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\definecolor{codebg}{RGB}{248,248,248}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  breaklines=true,
+  columns=fullflexible
+}
+
+\title{Three-Stage Legal Dialogue Training Pipeline Report\\(SFT $\rightarrow$ Multi-Objective $\rightarrow$ DPO)}
+\author{Project: \texttt{q1\_3stage\_pipeline}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Executive Summary}
+This report documents a strict \textbf{three-stage training pipeline} for a legal conversational model (Indian law: POCSO, IPC, CrPC) on \textbf{LLaMA-3.1-8B Instruct}. The stages are:
+\begin{enumerate}
+  \item \textbf{Stage 1 (SFT)}: supervised fine-tuning on multi-turn dialogue pairs (teacher-forced causal LM).
+  \item \textbf{Stage 2 (Multi-objective)}: continue training from Stage 1 with a weighted combination of:
+  \begin{itemize}
+    \item $L_{\text{gen}}$ (LM loss),
+    \item $L_{\text{entail}}$ (NLI teacher KL consistency),
+    \item $L_{\text{triplet}}$ (embedding-space separation with dynamic hard negatives).
+  \end{itemize}
+  \item \textbf{Stage 3 (DPO)}: preference optimization using a reference model and dynamic rejected responses.
+\end{enumerate}
+
+We additionally implemented \textbf{reproducibility, checkpointed resumption, dynamic negative mining, speed optimizations for entailment}, and \textbf{optimizer stability diagnostics} (AMP unscale + clipping, gradient sanity stats, update ratio proxy, contribution ratios).
+
+\section{Dataset and Splits}
+\subsection{Data characteristics}
+The dataset consists of multi-turn legal dialogues with Hindi/English code-mixing and Indian law domain constraints (statutes, procedures, and safety).
+
+\subsection{Split protocol}
+Training is dialogue-level split to avoid leakage across turns:
+\begin{itemize}
+  \item \textbf{Train}: \texttt{q1\_3stage\_pipeline/data/train\_70\_dialogues.jsonl}
+  \item \textbf{Val}: \texttt{q1\_3stage\_pipeline/data/val\_10\_dialogues.jsonl}
+  \item \textbf{Test}: \texttt{q1\_3stage\_pipeline/data/test\_20\_dialogues.jsonl}
+\end{itemize}
+Each dialogue JSONL record contains \texttt{turns}. Training code flattens dialogues into (prompt, response) examples in-memory.
+
+\section{Model and Tokenization}
+\subsection{Base model}
+Default base model (from config):
+\begin{lstlisting}
+meta-llama/Meta-Llama-3.1-8B-Instruct
+\end{lstlisting}
+
+\subsection{Prompt format}
+Prompts use a strict user/assistant delimiter format:
+\begin{lstlisting}
+[USER]: ...
+[ASSISTANT]:
+\end{lstlisting}
+The assistant span is the supervised target; prompt tokens are masked in labels (\texttt{-100}).
+
+\subsection{Code-mixed language tag (optional)}
+To improve conditioning in code-mixed legal text, Stage 2 supports an optional prefix:
+\begin{lstlisting}
+--lang-tag-prefix "[HI_EN_LEGAL]"
+\end{lstlisting}
+This prepends the tag to every input prompt (train and val) without changing dataset files.
+
+\section{Stage 1: Supervised Fine-Tuning (SFT)}
+\subsection{Objective}
+Standard teacher-forced causal LM cross-entropy:
+\[
+L_{\text{gen}} = \text{CE}(\text{LM}(x), y)
+\]
+where $x$ is the prompt and $y$ is the assistant completion. Prompt tokens are masked out in the label tensor.
+
+\subsection{Artifacts}
+Stage 1 outputs a Hugging Face-style \texttt{final/} directory that Stage 2 uses for initialization.
+
+\section{Stage 2: Multi-Objective Training}
+\subsection{High-level objective}
+Stage 2 optimizes a weighted sum:
+\[
+L = L_{\text{gen}} + \lambda_e \, w_e(t)\,L_{\text{entail}} + \lambda_t \, w_t(t)\,L_{\text{triplet}}
+\]
+
+\paragraph{Dynamic weight scheduling.}
+To avoid early instability from entailment spikes, the schedule uses step-progress $t \in [0,1]$:
+\begin{itemize}
+  \item Early (first 30\%): $w_e=0.3,\; w_t=0.3$
+  \item Mid: $w_e=0.7,\; w_t=0.5$
+  \item Late: $w_e=1.0,\; w_t=0.7$
+\end{itemize}
+
+\subsection{$L_{\text{entail}}$: NLI teacher KL}
+We use a frozen DeBERTa MNLI teacher to produce a 3-way distribution (contradiction, neutral, entailment) for:
+\[
+(\text{premise}=y^+,\; \text{hypothesis}=\hat{y})
+\]
+where $y^+$ is the reference answer and $\hat{y}$ is the model's greedy completion for the prompt.
+
+The student head predicts logits from pooled LM hidden states; the loss is:
+\[
+L_{\text{entail}} = \text{KL}\big(p_{\text{teacher}} \,\|\, p_{\text{student}}\big)
+\]
+
+\paragraph{Cost reductions.}
+To reduce training time:
+\begin{itemize}
+  \item \textbf{Shorter greedy decode}: default \texttt{--entail-max-new-tokens 48} (recommended: 32--48).
+  \item \textbf{Sparse computation}: \texttt{--entail-every N} computes entailment only every $N$ optimizer steps (default: 2).
+  \item \textbf{LRU caching}: \texttt{--entail-cache-size} caches greedy $\hat{y}$ per prompt to avoid recomputation.
+  \item \textbf{Teacher device}: \texttt{--nli-on-cpu} runs DeBERTa on CPU to save VRAM (slower but safer on shared GPUs).
+\end{itemize}
+
+\subsection{$L_{\text{triplet}}$: dynamic hard negatives + margin loss}
+\paragraph{Dynamic negative generation.}
+Negatives are \textbf{not stored in dataset files}. For each (prompt $x$, positive $y^+$) we form candidates:
+\begin{itemize}
+  \item \textbf{Model negative}: sampled generation from the current policy.
+  \item \textbf{Rule corruption}: statute/procedure contradiction (e.g., IPC section swaps).
+  \item \textbf{Cross-sample}: response from a different dialogue.
+\end{itemize}
+
+\paragraph{Hard / semi-hard mining.}
+We embed candidates with a frozen sentence encoder (SBERT/MPNet) and select a hard negative that is:
+\begin{itemize}
+  \item sufficiently similar to the prompt (hard),
+  \item less similar than the positive,
+  \item optionally constrained to a \textbf{semi-hard band} relative to $\text{sim}(x,y^+)$.
+\end{itemize}
+
+\paragraph{Loss.}
+Anchor is a learned projection of pooled LM hidden state; positives and negatives are sentence embeddings. With normalized vectors:
+\[
+L_{\text{triplet}} = \mathbb{E}\left[\max(0, d(a,p)-d(a,n)+m)\right]
+\]
+Default margin was reduced to $m=0.2$ (config can override) to reduce saturation.
+
+\subsection{Checkpointing and resume}
+Stage 2 writes a resumable checkpoint:
+\begin{lstlisting}
+output_dir/checkpoints/latest.pt
+\end{lstlisting}
+We optimized checkpoint size for large models by saving \textbf{PEFT adapter weights} (when applicable) rather than full 8B parameters.
+
+\subsection{Training stability (AMP + gradients)}
+\paragraph{Correct grad norm under AMP.}
+With \texttt{GradScaler}, gradients are scaled. We therefore:
+\begin{itemize}
+  \item call \texttt{scaler.unscale\_(optimizer)} before measuring/clipping,
+  \item clip gradients using \texttt{--grad-clip-max-norm} (default 1.0),
+  \item log gradient sanity stats: \texttt{min\_grad}, \texttt{max\_grad}, \texttt{grad\_norm}.
+\end{itemize}
+
+\paragraph{Optional skip threshold.}
+The ``skip step'' behavior is \textbf{disabled by default}. If desired:
+\begin{lstlisting}
+--skip-grad-norm-threshold 300
+\end{lstlisting}
+skips optimizer updates when the (unscaled, clipped) norm exceeds the threshold.
+
+\paragraph{Update ratio proxy.}
+We log:
+\[
+\text{update\_ratio} \approx \frac{\text{lr}\cdot\lVert g\rVert}{\lVert \theta\rVert}
+\]
+for trainable parameters, providing a compact stability signal.
+
+\paragraph{Contribution ratios.}
+Logs include per-step contributions:
+\begin{itemize}
+  \item \texttt{loss\_contrib\_gen}
+  \item \texttt{loss\_contrib\_entail} (already includes schedule and $\lambda_e$)
+  \item \texttt{loss\_contrib\_triplet} (includes schedule and $\lambda_t$)
+  \item \texttt{triplet\_contrib\_frac} = triplet contribution / total
+\end{itemize}
+
+\subsection{Logging and evaluation hooks}
+Training writes JSONL logs:
+\begin{lstlisting}
+output_dir/train_log.jsonl
+\end{lstlisting}
+Key fields include:
+\begin{itemize}
+  \item step counters: \texttt{epoch}, \texttt{opt\_step}, \texttt{micro\_step}
+  \item losses: \texttt{loss}, \texttt{loss\_gen}, \texttt{loss\_entail}, \texttt{loss\_triplet}
+  \item stability: \texttt{grad\_norm}, \texttt{min\_grad}, \texttt{max\_grad}, \texttt{scaler\_scale}, \texttt{update\_ratio}
+  \item rolling stats (window=50): moving averages and spike/saturation rates
+\end{itemize}
+
+\paragraph{Fixed qualitative evaluation.}
+Every \texttt{--fixed-eval-every} optimizer steps (default 200), we run 5 fixed prompts and log:
+\begin{itemize}
+  \item generated output
+  \item teacher entailment probability (entailment label probability)
+\end{itemize}
+This provides a stable view of reasoning improvement during training.
+
+\subsection{Debug-fast mode}
+\texttt{--debug-fast} runs a cheap end-to-end sanity pass:
+\begin{itemize}
+  \item 100 training samples
+  \item triplet disabled
+  \item entailment computed every 5 steps
+  \item generation caps reduced to 16 tokens
+\end{itemize}
+
+\section{Stage 3: DPO Preference Optimization}
+\subsection{Goal}
+Stage 3 performs preference optimization using:
+\begin{itemize}
+  \item \textbf{Policy}: Stage 2 final model
+  \item \textbf{Reference}: frozen copy of Stage 2 (or saved reference)
+  \item \textbf{Chosen}: ground truth $y^+$
+  \item \textbf{Rejected}: dynamic hard negatives $y^-$ (same family as Stage 2)
+\end{itemize}
+
+\subsection{Beta sweep}
+We support sweeping $\beta \in \{0.1, 0.5, 1.0\}$ (config) to tune the preference strength.
+
+\section{Reproducibility and Project Layout}
+\subsection{Reproducibility}
+We set deterministic seeds and save run configuration files:
+\begin{itemize}
+  \item \texttt{config\_used.yaml}
+  \item \texttt{run\_args.json}
+\end{itemize}
+for each training run directory under \texttt{q1\_3stage\_pipeline/logs/checkpoints/}.
+
+\subsection{Key directories}
+\begin{itemize}
+  \item \texttt{q1\_3stage\_pipeline/configs/}: YAML configuration
+  \item \texttt{q1\_3stage\_pipeline/data/}: JSONL splits (dialogue-level)
+  \item \texttt{q1\_3stage\_pipeline/logs/checkpoints/stage1/}: Stage 1 checkpoints
+  \item \texttt{q1\_3stage\_pipeline/logs/checkpoints/stage2/}: Stage 2 checkpoints + logs
+  \item \texttt{q1\_3stage\_pipeline/logs/checkpoints/stage3/}: Stage 3 outputs (DPO)
+\end{itemize}
+
+\section{Operational Notes}
+\subsection{Long epoch duration}
+Stage 2 is slow because it includes:
+\begin{itemize}
+  \item on-the-fly generation for negatives,
+  \item greedy decoding for entailment supervision,
+  \item NLI teacher forward pass,
+  \item embedding encoder for triplet mining.
+\end{itemize}
+The \texttt{--entail-every}, caching, and shorter \texttt{--entail-max-new-tokens} significantly reduce cost.
+
+\subsection{Gated model warnings}
+If the environment lacks Hugging Face access to gated model metadata, warnings about fetching remote config files may appear. Training can still proceed if model weights are already available locally.
+
+\section{Recommended Defaults (Stage 2)}
+\begin{lstlisting}
+--entail-max-new-tokens 32 or 48
+--entail-every 2 (or 3 if still slow)
+--entail-cache-size 2048
+--grad-clip-max-norm 1.0
+--skip-grad-norm-threshold 0   (disabled)
+\end{lstlisting}
+
+\end{document}
+
