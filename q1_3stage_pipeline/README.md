@@ -22,6 +22,29 @@ Run from the **repo root** (so relative paths work):
 
 All commands below assume `python3` is available (on this machine `python` may not exist).
 
+### Run the complete pipeline (one command)
+
+This repository includes a single orchestrator script that runs the full strict pipeline:
+
+**Stage 1 (SFT) → Stage 2 (multi-objective) → Stage 3 (DPO)**.
+
+From the repo root:
+
+```bash
+python3 q1_3stage_pipeline/run_full_pipeline.py \
+  --config q1_3stage_pipeline/configs/pipeline_default.yaml \
+  --seed 43 \
+  --gpu 0
+```
+
+Notes:
+- This script does **not** re-implement training; it calls the existing stage entrypoints:
+  - `q1_3stage_pipeline/stage1_sft/train.py`
+  - `q1_3stage_pipeline/stage2_multi_objective/train.py`
+  - `q1_3stage_pipeline/stage3_dpo/train.py`
+- It will auto-create `q1_3stage_pipeline/data/final_train_dialogues.jsonl` (dialogue-level train+val) if missing.
+- If you want Stage 2 to resume from `output_dir/checkpoints/latest.pt`, add `--resume-stage2`.
+
 ### Prerequisites (Hugging Face access + token)
 
 You must have access to the base model repo:
@@ -44,6 +67,15 @@ Alternative persistent login (writes to your user cache):
 
 ```bash
 huggingface-cli login
+```
+
+### Offline vs online model loading
+
+On some shared clusters, we run with offline mode to avoid network/gated-repo failures.
+If you are on a new server and need to download models, run with:
+
+```bash
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 q1_3stage_pipeline/run_full_pipeline.py --seed 43 --gpu 0
 ```
 
 ### 0) Sync the dataset into this folder
