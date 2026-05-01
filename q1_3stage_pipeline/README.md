@@ -37,6 +37,17 @@ python3 q1_3stage_pipeline/run_full_pipeline.py \
   --gpu 0
 ```
 
+### Run the complete pipeline (one command, shell + background)
+
+If you prefer a single `.sh` script (easy to run with `nohup`), use:
+
+```bash
+nohup bash q1_3stage_pipeline/run_full_pipeline.sh --gpu 0 --seed 43 > /dev/null 2>&1 &
+```
+
+Logs will be written under:
+`q1_3stage_pipeline/logs/pipeline_runs/`.
+
 Notes:
 - This script does **not** re-implement training; it calls the existing stage entrypoints:
   - `q1_3stage_pipeline/stage1_sft/train.py`
